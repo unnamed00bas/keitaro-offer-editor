@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keitaro offer editor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <b>Keitaro wrapper</b>
+  <nav>
+    <a href="#create" data-tab="create">New campaign</a>
+    <a href="#editor" data-tab="editor">Editor</a>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-create" class="tab">
+    <h2>New campaign</h2>
+    <form id="create-form" autocomplete="off">
+      <label>Name
+        <div class="prefixed"><span id="prefix"></span><input name="name" required placeholder="campaign1"></div>
+      </label>
+      <label>Geo (ISO-коды через запятую)
+        <input name="geo" required placeholder="AU,MX">
+      </label>
+      <label>Offer
+        <div class="ac" id="create-ac">
+          <input class="ac-input" placeholder="ID или часть названия">
+          <input type="hidden" name="offer_id">
+          <ul class="ac-list"></ul>
+        </div>
+      </label>
+      <p class="hint" id="create-hint"></p>
+      <button type="submit">Create</button>
+    </form>
+    <div id="create-result"></div>
+  </section>
+
+  <section id="tab-editor" class="tab" hidden>
+    <h2>Campaign editor</h2>
+    <div class="toolbar">
+      <select id="campaign-select"><option value="">— кампании с префиксом —</option></select>
+      <input id="campaign-id" type="number" placeholder="ID кампании в KT">
+      <button id="btn-fetch">Fetch streams from KT ⤓</button>
+      <a id="btn-view" class="button" target="_blank" rel="noopener">View in KT ↗</a>
+    </div>
+    <p class="hint" id="editor-hint"></p>
+    <div id="streams"></div>
+  </section>
+</main>
+
+<div id="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
