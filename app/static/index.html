@@ -45,12 +45,17 @@
       <input id="campaign-id" type="number" placeholder="ID кампании в KT">
       <button id="btn-fetch">Fetch streams from KT ⤓</button>
       <a id="btn-view" class="button" target="_blank" rel="noopener">View in KT ↗</a>
+      <span class="spacer"></span>
+      <label class="days">Статистика за
+        <select id="stats-days"><option>7</option><option>14</option><option>30</option></select> дн.</label>
+      <button id="btn-all-offers">Show all offers</button>
     </div>
     <p class="hint" id="editor-hint"></p>
     <div id="streams"></div>
   </section>
 </main>
 
+<div id="modal" hidden><div class="modal-box"><div class="modal-body"></div><div class="modal-actions"></div></div></div>
 <div id="toast" hidden></div>
 <script src="/static/app.js"></script>
 </body>

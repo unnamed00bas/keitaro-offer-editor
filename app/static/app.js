@@ -8,7 +8,12 @@ async function api(method, url, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data));
+  if (!r.ok) {
+    const err = new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data));
+    err.status = r.status;
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -36,7 +41,13 @@ function autocomplete(root, onPick) {
     onPick(null);
     clearTimeout(timer);
     timer = setTimeout(async () => {
-      try { items = await api("GET", `/api/offers?q=${encodeURIComponent(input.value)}`); sel = -1; render(); }
+      try {
+        items = await api("GET", `/api/offers?q=${encodeURIComponent(input.value)}`);
+        const q = input.value.trim();
+        // карточки части офферов скрыты правами в Keitaro — разрешаем добавить по точному ID
+        if (/^\d+$/.test(q) && !items.some((o) => String(o.id) === q)) items.push({ id: +q, name: "по ID (нет в списке, доступном этому пользователю Keitaro)" });
+        sel = -1; render();
+      }
       catch (e) { toast(e.message, true); }
     }, 200);
   });
@@ -88,8 +99,28 @@ async function initCreate() {
   });
 }
 
+/* ---------- модалка ---------- */
+function modal(html, buttons) {
+  const m = $("#modal");
+  $(".modal-body", m).innerHTML = html;
+  const actions = $(".modal-actions", m);
+  actions.innerHTML = "";
+  return new Promise((resolve) => {
+    buttons.forEach(([label, value, cls]) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (cls) b.className = cls;
+      b.onclick = () => { m.hidden = true; resolve(value); };
+      actions.appendChild(b);
+    });
+    m.hidden = false;
+  });
+}
+
 /* ---------- редактор ---------- */
 let currentKtId = null;
+let currentCampaign = null;
+let stats = null;
 
 async function loadCampaignList() {
   try {
@@ -109,34 +140,64 @@ function setCampaign(ktId, url) {
 }
 
 async function openCampaign(ktId) {
-  if (ktId !== currentKtId) $("#streams").innerHTML = "";
+  if (ktId !== currentKtId) { $("#streams").innerHTML = ""; stats = null; }
   setCampaign(ktId);
   try {
-    const c = await api("GET", `/api/campaigns/${ktId}`);
-    renderCampaign(c);
+    renderCampaign(await api("GET", `/api/campaigns/${ktId}`));
   } catch (e) {
-    // в редакторе ещё нет — подтягиваем из Keitaro
-    await fetchCampaign(ktId);
+    await fetchCampaign(ktId); // в редакторе ещё нет — подтягиваем из Keitaro
   }
 }
 
 async function fetchCampaign(ktId) {
-  const drafts = document.querySelectorAll(".stream.draft").length;
-  if (drafts && !confirm("Есть неопубликованные изменения. Fetch заменит их состоянием из Keitaro. Продолжить?")) return;
   try {
     const c = await api("POST", `/api/campaigns/${ktId}/fetch`);
     renderCampaign(c);
-    toast("Потоки загружены из Keitaro");
+    const conflicts = c.streams.reduce((n, s) => n + (s.conflicts || 0), 0);
+    toast(conflicts ? `Потоки загружены. Расхождений с черновиком: ${conflicts}, они отмечены` : "Потоки загружены из Keitaro", !!conflicts);
   } catch (e) { toast(e.message, true); }
 }
 
 function renderCampaign(c) {
+  currentCampaign = c;
   setCampaign(c.kt_id, c.kt_url);
   $("#editor-hint").textContent = `${c.name}${c.geo ? " · гео " + c.geo : ""} · загружено ${c.fetched_at ? new Date(c.fetched_at + "Z").toLocaleString() : "—"}`;
   const box = $("#streams");
   box.innerHTML = "";
   c.streams.forEach((s) => box.appendChild(streamEl(s)));
   if (!c.streams.length) box.innerHTML = `<p class="hint">В кампании нет потоков.</p>`;
+  loadStats();
+}
+
+async function loadStats() {
+  if (!currentKtId) return;
+  try {
+    stats = await api("GET", `/api/campaigns/${currentKtId}/stats?days=${$("#stats-days").value}`);
+    loadStatsCells();
+  } catch (e) { toast("Статистика: " + e.message, true); }
+}
+
+function sparkline(series) {
+  const w = 84, h = 22, max = Math.max(1, ...series);
+  const pts = series.map((v, i) => `${(i * w / Math.max(1, series.length - 1)).toFixed(1)},${(h - 2 - v / max * (h - 4)).toFixed(1)}`).join(" ");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><polyline fill="none" stroke="#2f6f9f" stroke-width="1.5" points="${pts}"/></svg>`;
+}
+
+function fillStats(el) {
+  const key = el.dataset.stats;
+  const trendEl = el.parentElement.querySelector(`[data-trend="${key}"]`);
+  const o = stats && stats.offers[key];
+  if (!stats) return;
+  if (!o) {
+    el.innerHTML = `<span class="flat">нет кликов</span>`;
+    if (trendEl) trendEl.innerHTML = sparkline(stats.days.map(() => 0)) + ` <span class="flat">—</span>`;
+    return;
+  }
+  el.innerHTML = `<b>${o.clicks}</b> кл. · ${o.conversions} конв. · CR ${o.cr}% · $${o.revenue}<br><span class="flat">сегодня ${o.today}</span>`;
+  let delta = `<span class="flat">0%</span>`;
+  if (o.trend_new) delta = `<span class="up">new</span>`;
+  else if (o.trend !== null) delta = `<span class="${o.trend > 0 ? "up" : o.trend < 0 ? "down" : "flat"}">${o.trend > 0 ? "▲" : o.trend < 0 ? "▼" : ""}${Math.abs(o.trend)}%</span>`;
+  if (trendEl) trendEl.innerHTML = sparkline(o.series) + " " + delta;
 }
 
 function streamEl(s) {
@@ -144,23 +205,29 @@ function streamEl(s) {
   el.dataset.stream = s.id;
   if (!s.has_offers) {
     el.className = "stream plain";
-    el.innerHTML = `Stream: <b>${esc(s.name)}</b> <small>(#${s.position}, KT id ${s.kt_id})</small>`;
+    el.innerHTML = `Stream: <b>${esc(s.name)}</b> <small>(#${s.position}, KT id ${s.kt_id}) · <span data-today="${s.kt_id}"></span></small>`;
+    if (stats) setTimeout(loadStatsCells, 0);
     return el;
   }
   el.className = "stream" + (s.draft ? " draft" : "");
   const rows = s.offers.map((o) => {
     const removed = o.status === "removed";
+    const key = `${s.kt_id}:${o.offer_id}`;
     const badges = [
       o.is_new && !removed ? `<span class="badge">new</span>` : "",
       o.removed_in_kt ? `<span class="badge gray">удалён в KT</span>` : "",
       removed && !o.removed_in_kt ? `<span class="badge gray">${o.published_status === "active" ? "будет удалён" : "архив"}</span>` : "",
       !removed && o.changed && !o.is_new ? `<span class="badge">было ${o.published_share}%</span>` : "",
+      o.conflict ? `<span class="badge warn">расхождение</span>` : "",
     ].join("");
     return `<tr class="${removed ? "removed" : ""}" data-offer="${o.offer_id}">
-      <td><span class="oname">[${o.offer_id}] ${esc(o.name)}</span>${badges}</td>
+      <td><span class="oname">[${o.offer_id}] ${esc(o.name)}</span>${badges}
+        ${o.conflict ? `<div class="conflict-note">⚠ ${esc(o.conflict)}</div>` : ""}</td>
       <td style="white-space:nowrap">${removed ? "0%" :
         `<span class="share" data-act="edit-share" title="Задать и закрепить долю">${o.share}%</span>
          <button class="pin ${o.pinned ? "on" : ""}" data-act="pin" title="${o.pinned ? "Открепить" : "Закрепить долю"}">📌</button>`}</td>
+      <td class="stats" data-stats="${key}"></td>
+      <td class="trend" data-trend="${key}"></td>
       <td style="text-align:right">${removed
         ? `<button data-act="bring-back">↺ Bring back</button>`
         : `<button class="danger" data-act="remove">🗑 Remove</button>`}</td>
@@ -168,20 +235,21 @@ function streamEl(s) {
   }).join("");
   el.innerHTML = `
     <div class="stream-head">
-      <div>Stream: <b>${esc(s.name)}</b> <small>(#${s.position}, KT id ${s.kt_id})</small>
+      <div>Stream: <b>${esc(s.name)}</b> <small>(#${s.position}, KT id ${s.kt_id}) · <span data-today="${s.kt_id}"></span></small>
         ${s.draft ? `<span class="badge">черновик, не опубликован</span>` : ""}</div>
       <div>Σ <b class="${s.total === 100 ? "" : "total-bad"}">${s.total}%</b>
         <button class="primary" data-act="push" ${s.draft ? "" : "disabled"}>Push to KT</button>
-        <button data-act="cancel" ${s.draft ? "" : "disabled"}>Cancel</button></div>
+        <button data-act="cancel" ${s.draft || s.conflicts ? "" : "disabled"}>Cancel</button></div>
     </div>
-    <table><thead><tr><th>Offer</th><th>Share</th><th></th></tr></thead><tbody>${rows ||
-      `<tr><td colspan="3" class="hint">Офферов нет</td></tr>`}</tbody></table>
+    <table><thead><tr><th>Offer</th><th>Share</th><th>Stats</th><th>Trends</th><th></th></tr></thead><tbody>${rows ||
+      `<tr><td colspan="5" class="hint">Офферов нет</td></tr>`}</tbody></table>
     <div class="add-row">
       <div class="ac"><input class="ac-input" placeholder="Добавить оффер: ID или название"><ul class="ac-list"></ul></div>
       <button data-act="add">Add</button>
     </div>`;
   let picked = null;
   autocomplete($(".ac", el), (o) => (picked = o));
+  if (stats) setTimeout(loadStatsCells, 0);
   el.addEventListener("click", async (e) => {
     const btn = e.target.closest("[data-act]");
     if (!btn) return;
@@ -204,11 +272,85 @@ function streamEl(s) {
         if (v === null) return;
         res = await api("POST", `${base}/offers/${offerId}/pin`, { pinned: true, share: parseInt(v, 10) });
       } else if (act === "cancel") res = await api("POST", `${base}/cancel`);
-      else if (act === "push") { res = await api("POST", `${base}/push`); toast("Опубликовано в Keitaro"); }
-      el.replaceWith(streamEl(res));
+      else if (act === "push") res = await pushStream(s);
+      if (res) replaceStream(res);
     } catch (err) { toast(err.message, true); }
   });
   return el;
+}
+
+function loadStatsCells() {
+  if (!stats) return;
+  document.querySelectorAll("[data-stats]").forEach(fillStats);
+  document.querySelectorAll("[data-today]").forEach((el) => {
+    const st = stats.streams[el.dataset.today];
+    el.textContent = `clicks today: ${st ? st.today : 0} · за ${stats.days.length} дн.: ${st ? st.clicks : 0}`;
+  });
+}
+
+function replaceStream(res) {
+  const old = document.querySelector(`[data-stream="${res.id}"]`);
+  if (old) old.replaceWith(streamEl(res));
+  if (currentCampaign) currentCampaign.streams = currentCampaign.streams.map((x) => (x.id === res.id ? res : x));
+}
+
+async function pushStream(s) {
+  try {
+    const res = await api("POST", `/api/streams/${s.id}/push`);
+    toast("Опубликовано в Keitaro");
+    return res;
+  } catch (err) {
+    if (err.status !== 409) throw err;
+    const d = err.data.diff || {};
+    const items = [
+      ...(d.added_in_kt || []).map((id) => `<li>в Keitaro добавлен оффер <b>${id}</b></li>`),
+      ...(d.removed_in_kt || []).map((id) => `<li>в Keitaro удалён оффер <b>${id}</b></li>`),
+      ...(d.share_changed || []).map((x) => `<li>оффер <b>${x.offer_id}</b>: доля ${x.was}% → ${x.now}%</li>`),
+    ].join("");
+    const choice = await modal(
+      `<h3>Поток изменили в Keitaro</h3><p>После последнего Fetch в Keitaro поменялось:</p><ul>${items}</ul>
+       <p class="hint">«Fetch и слить» подтянет эти изменения и сохранит ваш черновик. «Опубликовать поверх» перезапишет поток вашей версией.</p>`,
+      [["Отмена", null], ["Опубликовать поверх", "force", "danger"], ["Fetch и слить", "fetch", "primary"]]
+    );
+    if (choice === "force") {
+      const res = await api("POST", `/api/streams/${s.id}/push?force=true`);
+      toast("Опубликовано поверх изменений в Keitaro");
+      return res;
+    }
+    if (choice === "fetch") await fetchCampaign(currentKtId);
+    return null;
+  }
+}
+
+async function showAllOffers() {
+  if (!currentCampaign) return toast("Сначала откройте кампанию", true);
+  const offerStreams = currentCampaign.streams.filter((s) => s.has_offers);
+  const where = {};
+  offerStreams.forEach((s) => s.offers.forEach((o) => (where[o.offer_id] = o.status === "active" ? `в потоке, ${o.share}%` : "в архиве")));
+  const clicks = {};
+  if (stats) Object.entries(stats.offers).forEach(([k, v]) => { const id = k.split(":")[1]; clicks[id] = (clicks[id] || 0) + v.clicks; });
+  const all = await api("GET", "/api/offers?limit=1000");
+  const rowsHtml = (q) => all
+    .filter((o) => !q || `${o.id} ${o.name}`.toLowerCase().includes(q.toLowerCase()))
+    .map((o) => `<tr><td>${o.id}</td><td>${esc(o.name)}</td><td>${where[o.id] || ""}</td><td>${clicks[o.id] || 0}</td>
+      <td>${where[o.id] && where[o.id] !== "в архиве" || !offerStreams.length ? "" : `<button data-add="${o.id}">${where[o.id] ? "Bring back" : "Add"}</button>`}</td></tr>`).join("");
+  const p = modal(
+    `<h3>Все офферы Keitaro (${all.length})</h3>
+     <input id="all-q" placeholder="Фильтр по ID или названию" style="margin-bottom:8px">
+     <table><thead><tr><th>ID</th><th>Оффер</th><th>В кампании</th><th>Клики</th><th></th></tr></thead><tbody id="all-rows">${rowsHtml("")}</tbody></table>`,
+    [["Закрыть", null]]
+  );
+  $("#all-q").addEventListener("input", (e) => ($("#all-rows").innerHTML = rowsHtml(e.target.value)));
+  $("#all-rows").parentElement.addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-add]");
+    if (!b) return;
+    try {
+      const res = await api("POST", `/api/streams/${offerStreams[0].id}/offers`, { offer_id: +b.dataset.add });
+      replaceStream(res);
+      b.replaceWith(document.createTextNode("добавлен в черновик"));
+    } catch (err) { toast(err.message, true); }
+  });
+  await p;
 }
 
 function initEditor() {
@@ -218,6 +360,8 @@ function initEditor() {
     if (!id) return toast("Укажите ID кампании или выберите из списка", true);
     fetchCampaign(id).then(loadCampaignList);
   });
+  $("#stats-days").addEventListener("change", loadStats);
+  $("#btn-all-offers").addEventListener("click", () => showAllOffers().catch((e) => toast(e.message, true)));
 }
 
 window.addEventListener("hashchange", showTab);
