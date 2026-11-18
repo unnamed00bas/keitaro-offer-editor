@@ -69,6 +69,8 @@ class StreamOffer(Base):
     pub_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
 
     removed_in_kt: Mapped[bool] = mapped_column(Boolean, default=False)
+    # пометка после Fetch, если Keitaro и черновик разошлись (показывается в интерфейсе)
+    conflict: Mapped[str | None] = mapped_column(String(255), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     stream: Mapped[Stream] = relationship(back_populates="offers")

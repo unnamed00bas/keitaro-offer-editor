@@ -17,6 +17,13 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite:///./editor.db"
 
+    # вход в саму обёртку (HTTP Basic); пустой пароль = вход выключен
+    auth_username: str = "admin"
+    auth_password: str = ""
+
+    stats_days: int = 7
+    stats_timezone: str = "Europe/Moscow"
+
     @property
     def api_url(self) -> str:
         return self.keitaro_admin_url.rstrip("/") + "_api/v1"

@@ -21,7 +21,9 @@ class KeitaroAPI(Protocol):
     def create_campaign(self, payload: dict) -> dict: ...
     def get_streams(self, campaign_id: int) -> list[dict]: ...
     def create_stream(self, payload: dict) -> dict: ...
+    def get_stream(self, stream_id: int) -> dict: ...
     def update_stream_offers(self, stream_id: int, offers: list[dict]) -> dict: ...
+    def build_report(self, payload: dict) -> dict: ...
 
 
 class KeitaroClient:
@@ -69,6 +71,12 @@ class KeitaroClient:
 
     def create_stream(self, payload: dict) -> dict:
         return self._call("POST", "/streams", json=payload)
+
+    def get_stream(self, stream_id: int) -> dict:
+        return self._call("GET", f"/streams/{stream_id}")
+
+    def build_report(self, payload: dict) -> dict:
+        return self._call("POST", "/report/build", json=payload)
 
     def update_stream_offers(self, stream_id: int, offers: list[dict]) -> dict:
         # PUT заменяет весь список офферов потока целиком

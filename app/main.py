@@ -1,7 +1,9 @@
+import base64
+import secrets
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -26,6 +28,38 @@ def get_api() -> KeitaroAPI:
     if _client is None:
         _client = KeitaroClient(get_settings())
     return _client
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    """HTTP Basic на всё приложение. Логин/пароль из AUTH_USERNAME / AUTH_PASSWORD."""
+    settings = get_settings_dep(request)
+    if settings.auth_password:
+        ok = False
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("basic "):
+            try:
+                user, _, pwd = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+                ok = secrets.compare_digest(user.encode(), settings.auth_username.encode()) and secrets.compare_digest(
+                    pwd.encode(), settings.auth_password.encode()
+                )
+            except (ValueError, UnicodeDecodeError):
+                ok = False
+        if not ok:
+            return Response(
+                "Нужен вход", status_code=401, headers={"WWW-Authenticate": 'Basic realm="keitaro-editor", charset="UTF-8"'}
+            )
+    return await call_next(request)
+
+
+def get_settings_dep(request: Request) -> Settings:
+    override = request.app.dependency_overrides.get(get_settings)
+    return override() if override else get_settings()
+
+
+@app.exception_handler(services.PushConflict)
+def push_conflict(_, exc: services.PushConflict):
+    return JSONResponse(status_code=409, content={"detail": str(exc), "diff": exc.diff})
 
 
 @app.exception_handler(services.EditorError)
@@ -70,7 +104,7 @@ def config(settings: Settings = Depends(get_settings)):
 
 
 @app.get("/api/offers")
-def search_offers(q: str = "", limit: int = Query(20, le=100), api: KeitaroAPI = Depends(get_api)):
+def search_offers(q: str = "", limit: int = Query(20, le=1000), api: KeitaroAPI = Depends(get_api)):
     q = q.strip().lower()
     out = []
     for o in api.list_offers():
@@ -166,5 +200,16 @@ def cancel(stream_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/streams/{stream_id}/push")
-def push(stream_id: int, db: Session = Depends(get_db), api: KeitaroAPI = Depends(get_api)):
-    return _stream_response(db, services.push_stream(db, api, stream_id))
+def push(stream_id: int, force: bool = False, db: Session = Depends(get_db), api: KeitaroAPI = Depends(get_api)):
+    """Публикация. Если поток в Keitaro поменялся после Fetch — 409 с diff; force=true публикует поверх."""
+    return _stream_response(db, services.push_stream(db, api, stream_id, force=force))
+
+
+@app.get("/api/campaigns/{kt_id}/stats")
+def stats(
+    kt_id: int,
+    days: int | None = Query(None, ge=2, le=90),
+    api: KeitaroAPI = Depends(get_api),
+    settings: Settings = Depends(get_settings),
+):
+    return services.campaign_stats(api, kt_id, days or settings.stats_days, tz=settings.stats_timezone)

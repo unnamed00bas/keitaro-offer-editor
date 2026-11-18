@@ -2,7 +2,8 @@
 
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -53,9 +54,10 @@ def offer_names(api: KeitaroAPI) -> dict[int, str]:
 def create_campaign(db: Session, api: KeitaroAPI, settings: Settings, name: str, geo, offer_id: int) -> Campaign:
     codes = parse_geo(geo)
     full_name = normalize_name(name, settings.campaign_prefix)
+    if offer_id <= 0:
+        raise EditorError("Неверный ID оффера")
+    # оффер может быть не виден в списке (права пользователя Keitaro), но доступен по ID
     names = offer_names(api)
-    if offer_id not in names:
-        raise EditorError(f"Оффер {offer_id} не найден в Keitaro")
 
     kt = api.create_campaign(
         {
@@ -117,9 +119,9 @@ def get_or_import(db: Session, api: KeitaroAPI, kt_id: int) -> Campaign:
 def fetch_campaign(db: Session, api: KeitaroAPI, kt_id: int, names: dict[int, str] | None = None) -> Campaign:
     """«Fetch streams from KT»: Keitaro — источник правды для опубликованного состояния.
 
-    * черновик (неопубликованные правки) сбрасывается;
-    * оффер, который мы знали, но которого больше нет в Keitaro, не удаляется,
-      а помечается removed (серый, с кнопкой Bring back);
+    * неопубликованный черновик сливается с Keitaro (см. _sync_offers);
+    * оффер, который мы знали, но которого больше нет в Keitaro, остаётся у нас
+      со статусом removed (серый, с кнопкой Bring back);
     * закрепления (pins) и архив живут только у нас и сохраняются.
     """
     campaign = get_or_import(db, api, kt_id)
@@ -155,38 +157,83 @@ def fetch_campaign(db: Session, api: KeitaroAPI, kt_id: int, names: dict[int, st
 
 
 def _sync_offers(db: Session, stream: Stream, kt_offers: list[dict], names: dict[int, str]) -> None:
-    by_offer = {o.offer_id: o for o in stream.offers}
-    in_kt = set()
+    """Слияние состояния из Keitaro с локальным черновиком.
+
+    * опубликованное состояние (pub_*) всегда берётся из Keitaro;
+    * офферы без локальных правок просто принимают состояние Keitaro;
+    * локальные правки (добавления, удаления, закрепления) сохраняются;
+    * удалённый в Keitaro оффер помечается removed, добавленный в Keitaro — появляется;
+    * если Keitaro и черновик разошлись по одному офферу, в conflict пишется пояснение;
+    * если в потоке остался черновик, доли пересчитываются с учётом закреплений.
+    """
+    kt = {}
     for ko in kt_offers:
-        oid = int(ko["offer_id"])
-        in_kt.add(oid)
-        row = by_offer.get(oid)
-        if row is None:
-            row = StreamOffer(offer_id=oid)
-            stream.offers.append(row)
-        share = int(ko.get("share") or 0)
-        row.offer_name = names.get(oid, row.offer_name or str(oid))
-        row.pub_share = share
-        row.pub_status = ACTIVE
-        row.share = share
-        row.status = ACTIVE
-        row.removed_in_kt = False
-        row.pub_pinned = row.pinned
-    for oid, row in by_offer.items():
-        if oid in in_kt:
+        if ko.get("state", "active") == "active":
+            kt[int(ko["offer_id"])] = int(ko.get("share") or 0)
+    had_draft = is_draft(stream) or any(r.pinned for r in stream.offers)
+    known = set()
+
+    for row in list(stream.offers):
+        known.add(row.offer_id)
+        row.conflict = None
+        row.offer_name = names.get(row.offer_id) or row.offer_name or f"Offer {row.offer_id}"
+        local_changed = row.is_changed or row.pinned or (row.pinned != row.pub_pinned)
+        old_status, old_share = row.pub_status, row.pub_share
+
+        if row.offer_id in kt:
+            new_share = kt[row.offer_id]
+            kt_changed = old_status != ACTIVE or old_share != new_share
+            row.pub_status, row.pub_share, row.removed_in_kt = ACTIVE, new_share, False
+            if not local_changed:
+                row.status, row.share = ACTIVE, new_share
+                row.pub_pinned = row.pinned
+            elif kt_changed and old_status is not None:
+                if old_status == REMOVED:
+                    row.conflict = "В Keitaro оффер вернули, оставлен ваш черновик"
+                else:
+                    row.conflict = f"В Keitaro доля менялась ({old_share}% → {new_share}%), оставлен ваш черновик"
             continue
-        if row.pub_status is None:
-            # добавлен в черновике и не опубликован — черновик сбрасывается
-            stream.offers.remove(row)
-            db.delete(row)
+
+        if old_status == ACTIVE:
+            row.pub_status, row.pub_share, row.removed_in_kt = REMOVED, 0, True
+            if local_changed and row.status == ACTIVE:
+                row.conflict = "Удалён в Keitaro, пока вы правили черновик"
+            row.status, row.share = REMOVED, 0
+            row.pinned = row.pub_pinned = False
+        # pub_status None — локальное добавление, ждёт Push; REMOVED — архив: ничего не меняем
+
+    for oid, share in kt.items():
+        if oid in known:
             continue
-        if row.pub_status == ACTIVE:
-            row.removed_in_kt = True
-        row.pub_status = REMOVED
-        row.pub_share = 0
-        row.status = REMOVED
-        row.share = 0
-        row.pinned = row.pub_pinned = False
+        row = StreamOffer(
+            offer_id=oid, offer_name=names.get(oid, f"Offer {oid}"), status=ACTIVE, share=share,
+            pub_status=ACTIVE, pub_share=share, pinned=False, pub_pinned=False, removed_in_kt=False,
+        )
+        if had_draft:
+            row.conflict = "Добавлен в Keitaro, пока вы правили черновик"
+        stream.offers.append(row)
+
+    db.flush()
+    if had_draft and is_draft(stream):
+        _apply_recalc(stream)
+
+
+class PushConflict(EditorError):
+    def __init__(self, diff: dict):
+        super().__init__("Поток в Keitaro изменился после последнего Fetch")
+        self.diff = diff
+
+
+def stream_diff(snapshot: dict[int, int], current: dict[int, int]) -> dict:
+    return {
+        "added_in_kt": sorted(set(current) - set(snapshot)),
+        "removed_in_kt": sorted(set(snapshot) - set(current)),
+        "share_changed": [
+            {"offer_id": oid, "was": snapshot[oid], "now": current[oid]}
+            for oid in sorted(set(snapshot) & set(current))
+            if snapshot[oid] != current[oid]
+        ],
+    }
 
 
 # ---------------------------------------------------------------- черновик
@@ -228,10 +275,12 @@ def add_offer(db: Session, api: KeitaroAPI, stream_id: int, offer_id: int) -> St
         if existing.is_active:
             raise EditorError(f"Оффер {offer_id} уже есть в потоке")
         return bring_back(db, stream_id, offer_id)
+    if offer_id <= 0:
+        raise EditorError("Неверный ID оффера")
+    # карточка оффера может быть скрыта правами пользователя Keitaro; добавляем по ID,
+    # несуществующий ID Keitaro отклонит при Push
     names = offer_names(api)
-    if offer_id not in names:
-        raise EditorError(f"Оффер {offer_id} не найден в Keitaro")
-    row = StreamOffer(offer_id=offer_id, offer_name=names[offer_id], status=ACTIVE, share=0)
+    row = StreamOffer(offer_id=offer_id, offer_name=names.get(offer_id, f"Offer {offer_id}"), status=ACTIVE, share=0)
     stream.offers.append(row)
     db.flush()
     _apply_recalc(stream)
@@ -289,11 +338,12 @@ def cancel_draft(db: Session, stream_id: int) -> Stream:
         row.share = row.pub_share or 0
         row.status = row.pub_status
         row.pinned = row.pub_pinned
+        row.conflict = None
     db.flush()
     return stream
 
 
-def push_stream(db: Session, api: KeitaroAPI, stream_id: int) -> Stream:
+def push_stream(db: Session, api: KeitaroAPI, stream_id: int, force: bool = False) -> Stream:
     stream = _get_stream(db, stream_id)
     active = [r for r in stream.offers if r.is_active]
     try:
@@ -301,11 +351,23 @@ def push_stream(db: Session, api: KeitaroAPI, stream_id: int) -> Stream:
     except ShareError as e:
         raise EditorError(str(e)) from e
 
+    # защита от гонки: Keitaro должен совпадать с тем, что мы видели при последнем Fetch/Push
+    if not force:
+        current = {
+            int(o["offer_id"]): int(o.get("share") or 0)
+            for o in (api.get_stream(stream.kt_id).get("offers") or [])
+            if o.get("state", "active") == "active"
+        }
+        snapshot = {r.offer_id: int(r.pub_share or 0) for r in stream.offers if r.pub_status == ACTIVE}
+        if current != snapshot:
+            raise PushConflict(stream_diff(snapshot, current))
+
     payload = [{"offer_id": r.offer_id, "share": r.share, "state": "active"} for r in active]
     result = api.update_stream_offers(stream.kt_id, payload)
     kt_shares = {int(o["offer_id"]): int(o.get("share") or 0) for o in (result or {}).get("offers", [])}
 
     for row in list(stream.offers):
+        row.conflict = None
         if row.is_active:
             row.pub_status = ACTIVE
             row.pub_share = kt_shares.get(row.offer_id, row.share)
@@ -350,6 +412,7 @@ def serialize_stream(stream: Stream) -> dict:
         "schema": stream.kt_schema,
         "has_offers": stream.has_offers,
         "draft": is_draft(stream) if stream.has_offers else False,
+        "conflicts": sum(1 for r in offers if r.conflict),
         "total": sum(r.share for r in offers if r.is_active),
         "offers": [
             {
@@ -363,7 +426,70 @@ def serialize_stream(stream: Stream) -> dict:
                 "is_new": r.pub_status is None,
                 "changed": r.is_changed,
                 "removed_in_kt": r.removed_in_kt,
+                "conflict": r.conflict,
             }
             for r in sorted(offers, key=lambda r: (r.status != ACTIVE, r.id))
         ],
+    }
+
+
+# ---------------------------------------------------------------- статистика
+
+
+def campaign_stats(api: KeitaroAPI, kt_id: int, days: int = 7, today: date | None = None, tz: str = "Europe/Moscow") -> dict:
+    """Клики/конверсии/доход по офферам и потокам кампании за `days` дней + дневной ряд кликов для тренда."""
+    days = max(2, min(days, 90))
+    today = today or datetime.now(ZoneInfo(tz)).date()
+    start = today - timedelta(days=days - 1)
+    day_list = [(start + timedelta(days=i)).isoformat() for i in range(days)]
+    report = api.build_report(
+        {
+            "range": {"from": start.isoformat(), "to": today.isoformat(), "timezone": tz},
+            "dimensions": ["stream_id", "offer_id", "day"],
+            "measures": ["clicks", "conversions", "revenue"],
+            "filters": [{"name": "campaign_id", "operator": "EQUALS", "expression": kt_id}],
+            "limit": 10000,
+        }
+    )
+    offers: dict[str, dict] = {}
+    streams: dict[str, dict] = {}
+
+    def bucket(store: dict, key: str) -> dict:
+        return store.setdefault(
+            key, {"clicks": 0, "conversions": 0, "revenue": 0.0, "today": 0, "series": dict.fromkeys(day_list, 0)}
+        )
+
+    for row in (report or {}).get("rows", []):
+        day = str(row.get("day", ""))[:10]
+        clicks = int(row.get("clicks") or 0)
+        conv = int(row.get("conversions") or 0)
+        rev = float(row.get("revenue") or 0)
+        targets = [bucket(streams, str(int(row.get("stream_id") or 0)))]
+        if int(row.get("offer_id") or 0):
+            targets.append(bucket(offers, f"{int(row['stream_id'] or 0)}:{int(row['offer_id'])}"))
+        for b in targets:
+            b["clicks"] += clicks
+            b["conversions"] += conv
+            b["revenue"] += rev
+            if day in b["series"]:
+                b["series"][day] += clicks
+            if day == today.isoformat():
+                b["today"] += clicks
+
+    def finish(b: dict) -> dict:
+        series = list(b.pop("series").values())
+        half = len(series) // 2
+        prev, last = sum(series[:half]), sum(series[-half:])
+        b["series"] = series
+        b["cr"] = round(100 * b["conversions"] / b["clicks"], 2) if b["clicks"] else 0.0
+        b["revenue"] = round(b["revenue"], 2)
+        # тренд: вторая половина периода против первой, в процентах
+        b["trend"] = None if prev == 0 else round(100 * (last - prev) / prev)
+        b["trend_new"] = prev == 0 and last > 0
+        return b
+
+    return {
+        "days": day_list,
+        "offers": {k: finish(v) for k, v in offers.items()},
+        "streams": {k: finish(v) for k, v in streams.items()},
     }
